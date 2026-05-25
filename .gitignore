@@ -1,0 +1,14 @@
+# Project-specific
+datasets/
+temp/
+videos/
+
+# Environments
+.env
+.venv
+env/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
