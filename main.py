@@ -1,17 +1,21 @@
 import os
 import random
+import re
 import shutil
 import subprocess
+from itertools import count
 
 import cv2
 import numpy as np
+import torch
 from PIL import Image
 from sam2.build_sam import build_sam2_video_predictor
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 videos_dir = os.path.join(BASE_DIR, "videos")
-dataset_dir = os.path.join(BASE_DIR, "datasets")
+datasets_dir = os.path.join(BASE_DIR, "datasets")
 temp_dir = os.path.join(BASE_DIR, "temp")
+dataset_dir = os.path.join(BASE_DIR, "dataset")
 sam2_checkpoint = "checkpoints/sam2.1_hiera_large.pt"
 sam2_config = "configs/sam2.1/sam2.1_hiera_l.yaml"
 
@@ -22,16 +26,16 @@ should_draw_bbox = True
 is_propagated = False
 device = "cpu"
 
-# if torch.cuda.is_available():
-#     vram = torch.cuda.get_device_properties(0).total_memory / 1024**3
-#     if vram >= 1.5:
-#         device = "cuda"
+if torch.cuda.is_available():
+    vram = torch.cuda.get_device_properties(0).total_memory / 1024**3
+    if vram >= 1.5:
+        device = "cuda"
 
-# if device == "cuda":
-#     torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
-#     if torch.cuda.get_device_properties(0).major >= 8:
-#         torch.backends.cuda.matmul.allow_tf32 = True
-#         torch.backends.cudnn.allow_tf32 = True
+if device == "cuda":
+    torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
+    if torch.cuda.get_device_properties(0).major >= 8:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
 frame_prompt_point_dict = dict()
 current_index = 0
@@ -166,7 +170,7 @@ def refresh_image():
             x1, y1, x2, y2 = bbox
             cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 255), 2)
 
-    scale, new_w, new_h, offset_x, offset_y = transform_display()
+    _, new_w, new_h, offset_x, offset_y = transform_display()
     canvas = np.zeros((height, width, 3), dtype=np.uint8)
     canvas[offset_y : offset_y + new_h, offset_x : offset_x + new_w] = cv2.resize(
         img, (new_w, new_h)
@@ -177,9 +181,9 @@ def refresh_image():
     cv2.putText(img, num_hint, (30, 80), cv2.FONT_HERSHEY_SIMPLEX, 3, (255, 0, 0), 2)
 
     nav_hint = (
-        "ANNOTATE: D/F=nav  LClick=pos  RClick=neg  R=reset  P=propagate"
+        "ANNOTATE: D/F=nav  LClick=pos  RClick=neg  R=reset  P=propagate  E=export  M=merge"
         if not is_propagated
-        else "REVIEW: D/F=nav  Click=fix  P=re-prop  E=export  H=bbox"
+        else "REVIEW: D/F=nav  Click=fix  P=re-prop  H=bbox  E=export  N=next  M=merge"
     )
     color = (0, 140, 255) if not is_propagated else (0, 200, 0)
     cv2.putText(img, nav_hint, (20, height - 20), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
@@ -273,15 +277,102 @@ def find_box_in_mask(mask: np.array):
     return int(x_min), int(y_min), int(x_max), int(y_max)
 
 
-def create_dataset(video_segments):
+def merge_datasets():
     if os.path.exists(dataset_dir):
         shutil.rmtree(dataset_dir)
 
     for split in ("train", "val", "test"):
-        os.makedirs(os.path.join(dataset_dir, "labels", split), exist_ok=True)
         os.makedirs(os.path.join(dataset_dir, "images", split), exist_ok=True)
+        os.makedirs(os.path.join(dataset_dir, "labels", split), exist_ok=True)
+
+    all_dirs = sorted(
+        d
+        for d in os.listdir(datasets_dir)
+        if os.path.isdir(os.path.join(datasets_dir, d))
+    )
+
+    class_map = {}
+    for d in all_dirs:
+        m = re.match(r"^(.+)_\d+$", d)
+        name = m.group(1) if m else d
+        class_map.setdefault(name, []).append(d)
+
+    base_names = sorted(class_map)
+
+    for class_idx, name in enumerate(base_names):
+        pairs = []
+        for ds_folder in class_map[name]:
+            ds_path = os.path.join(datasets_dir, ds_folder)
+            for split in ("train", "val", "test"):
+                src_images = os.path.join(ds_path, "images", split)
+                src_labels = os.path.join(ds_path, "labels", split)
+                if os.path.exists(src_images):
+                    for f in os.listdir(src_images):
+                        stem = os.path.splitext(f)[0]
+                        label_file = stem + ".txt"
+                        pairs.append(
+                            (
+                                os.path.join(src_images, f),
+                                os.path.join(src_labels, label_file),
+                                f,
+                                label_file,
+                            )
+                        )
+
+        random.shuffle(pairs)
+        total = len(pairs)
+        val_count = max(1, round(total * 0.15))
+        test_count = max(1, round(total * 0.15))
+        train_count = max(0, total - val_count - test_count)
+        split_labels = (
+            ["train"] * train_count + ["val"] * val_count + ["test"] * test_count
+        )
+
+        for (img_src, lbl_src, img_name, lbl_name), split in zip(pairs, split_labels):
+            shutil.copy2(img_src, os.path.join(dataset_dir, "images", split, img_name))
+            if os.path.exists(lbl_src):
+                with open(lbl_src) as fin:
+                    lines = fin.readlines()
+                with open(
+                    os.path.join(dataset_dir, "labels", split, lbl_name), "w"
+                ) as fout:
+                    for line in lines:
+                        parts = line.strip().split()
+                        parts[0] = str(class_idx)
+                        fout.write(" ".join(parts) + "\n")
+
+    names_str = "\n".join(f"  {i}: {name}" for i, name in enumerate(base_names))
+    yaml = (
+        f"path: {dataset_dir}\n"
+        f"train: images/train\n"
+        f"val: images/val\n"
+        f"test: images/test\n"
+        f"\n"
+        f"names:\n"
+        f"{names_str}\n"
+    )
+
+    with open(os.path.join(dataset_dir, "dataset.yaml"), "w") as f:
+        f.write(yaml)
+
+    print(f"Merged {len(base_names)} classes: {base_names}")
+
+
+def create_dataset(video_segments):
+    output_dir = os.path.join(datasets_dir, dataset_name)
+    if os.path.exists(output_dir):
+        output_dir = next(
+            os.path.join(datasets_dir, f"{dataset_name}_{n}")
+            for n in count(1)
+            if not os.path.exists(os.path.join(datasets_dir, f"{dataset_name}_{n}"))
+        )
+
+    for split in ("train", "val", "test"):
+        os.makedirs(os.path.join(output_dir, "labels", split), exist_ok=True)
+        os.makedirs(os.path.join(output_dir, "images", split), exist_ok=True)
 
     valid_frames = []
+
     for frame_idx in video_segments:
         mask = video_segments[frame_idx][0]
         bbox = find_box_in_mask(mask)
@@ -315,7 +406,8 @@ def create_dataset(video_segments):
         ("test", valid_frames[test_end:]),
     ]:
         for frame_filename, cropped_image, cropped_bbox in frames:
-            label_filename = os.path.splitext(frame_filename)[0] + ".txt"
+            image_filename = f"{dataset_name}_{os.path.splitext(frame_filename)[0]}.jpg"
+            label_filename = f"{dataset_name}_{os.path.splitext(frame_filename)[0]}.txt"
 
             x1, y1, x2, y2 = cropped_bbox
             crop_h, crop_w = cropped_image.shape[:2]
@@ -325,18 +417,18 @@ def create_dataset(video_segments):
             w = (x2 - x1) / crop_w
             h = (y2 - y1) / crop_h
 
-            with open(
-                os.path.join(dataset_dir, "labels", split, label_filename), "w"
-            ) as f:
-                f.write(f"0 {x_center:.6f} {y_center:.6f} {w:.6f} {h:.6f}\n")
-
             cv2.imwrite(
-                os.path.join(dataset_dir, "images", split, frame_filename),
+                os.path.join(output_dir, "images", split, image_filename),
                 cropped_image,
             )
 
+            with open(
+                os.path.join(output_dir, "labels", split, label_filename), "w"
+            ) as f:
+                f.write(f"0 {x_center:.6f} {y_center:.6f} {w:.6f} {h:.6f}\n")
+
     yaml = (
-        f"path: {dataset_dir}\n"
+        f"path: {output_dir}\n"
         f"train: images/train\n"
         f"val: images/val\n"
         f"test: images/test\n"
@@ -345,82 +437,105 @@ def create_dataset(video_segments):
         f"  0: {dataset_name}\n"
     )
 
-    with open(os.path.join(dataset_dir, "data.yaml"), "w") as f:
+    with open(os.path.join(output_dir, f"{dataset_name}_data.yaml"), "w") as f:
         f.write(yaml)
 
     print(f"Dataset created: train={train_count}, val={val_count}, test={test_count}")
 
 
-video_file = select_video()
-dataset_name = select_dataset_name()
-frame_stride = select_frame_stride()
+def run_session():
+    global frame_prompt_point_dict, current_index, old_index, prompts
+    global video_segments, current_video_segment_mask, is_propagated
+    global dataset_name, frame_names, frame_width, frame_height, total
+    global predictor, inference_state
 
-if os.path.exists(temp_dir):
-    shutil.rmtree(temp_dir)
-os.makedirs(temp_dir)
+    frame_prompt_point_dict = dict()
+    current_index = 0
+    old_index = -1
+    prompts = dict()
+    video_segments = dict()
+    current_video_segment_mask = None
+    is_propagated = False
 
-if frame_stride == 1:
-    command = f'ffmpeg -i "{video_file}" -q:v 2 -start_number 0 "{temp_dir}/%05d.jpg"'
-else:
-    command = (
-        f'ffmpeg -i "{video_file}"'
-        f" -vf \"select='not(mod(n\\,{frame_stride}))'\" -vsync vfr"
-        f' -q:v 2 -start_number 0 "{temp_dir}/%05d.jpg"'
+    video_file = select_video()
+    dataset_name = select_dataset_name()
+    frame_stride = select_frame_stride()
+
+    if os.path.exists(temp_dir):
+        shutil.rmtree(temp_dir)
+    os.makedirs(temp_dir)
+
+    if frame_stride == 1:
+        command = (
+            f'ffmpeg -i "{video_file}" -q:v 2 -start_number 0 "{temp_dir}/%05d.jpg"'
+        )
+    else:
+        command = (
+            f'ffmpeg -i "{video_file}"'
+            f" -vf \"select='not(mod(n\\,{frame_stride}))'\" -vsync vfr"
+            f' -q:v 2 -start_number 0 "{temp_dir}/%05d.jpg"'
+        )
+    env = os.environ.copy()
+    env.pop("LD_LIBRARY_PATH", None)
+    subprocess.run(command, shell=True, env=env)
+
+    predictor = build_sam2_video_predictor(sam2_config, sam2_checkpoint, device=device)
+    inference_state = predictor.init_state(video_path=temp_dir)
+
+    frame_names = [
+        p for p in os.listdir(temp_dir) if os.path.splitext(p)[-1] in img_formats
+    ]
+    frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
+
+    frame_width, frame_height = Image.open(os.path.join(temp_dir, frame_names[0])).size
+    total = len(frame_names)
+
+    cv2.namedWindow(
+        "auto_annotate_tracking",
+        flags=cv2.WINDOW_AUTOSIZE | cv2.WINDOW_KEEPRATIO | cv2.WINDOW_GUI_NORMAL,
     )
-env = os.environ.copy()
-env.pop("LD_LIBRARY_PATH", None)
-subprocess.run(command, shell=True, env=env)
+    cv2.setMouseCallback("auto_annotate_tracking", mouse_callback)
 
-predictor = build_sam2_video_predictor(sam2_config, sam2_checkpoint, device=device)
-inference_state = predictor.init_state(video_path=temp_dir)
+    speed_change_frame = 1
 
-frame_names = [
-    p for p in os.listdir(temp_dir) if os.path.splitext(p)[-1] in img_formats
-]
-frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
+    while True:
+        if old_index != current_index:
+            old_index = current_index
+            refresh_image()
 
-frame_width, frame_height = Image.open(os.path.join(temp_dir, frame_names[0])).size
+        key = cv2.waitKey(1)
+        if key == ord("q"):
+            return False
+        elif key == ord("d"):
+            step = min(speed_change_frame, current_index)
+            current_index -= step
+            speed_change_frame = 10
+        elif key == ord("f") and current_index < total - 1:
+            step = min(speed_change_frame, total - current_index - 1)
+            current_index += step
+            speed_change_frame = 10
+        elif key == ord("r"):
+            del frame_prompt_point_dict[current_index]
+            refresh_image()
+        elif key == ord("h"):
+            should_draw_bbox = not should_draw_bbox
+            refresh_image()
+        elif key == ord("p"):
+            video_segments = propagate_images()
+            refresh_image()
+        elif key == ord("e"):
+            create_dataset(video_segments)
+        elif key == ord("m"):
+            merge_datasets()
+        elif key == ord("n"):
+            cv2.destroyAllWindows()
+            return True
+        elif key == -1:
+            speed_change_frame = 1
 
-total = len(frame_names)
-speed_change_frame = 1
 
-cv2.namedWindow(
-    "auto_annotate_tracking",
-    flags=cv2.WINDOW_AUTOSIZE | cv2.WINDOW_KEEPRATIO | cv2.WINDOW_GUI_NORMAL,
-)
-cv2.setMouseCallback("auto_annotate_tracking", mouse_callback)
-
-while True:
-    if old_index != current_index:
-        old_index = current_index
-        refresh_image()
-
-    key = cv2.waitKey(1)
-    if key == ord("q"):
-        break
-    elif key == ord("d"):
-        step = min(speed_change_frame, current_index)
-        current_index -= step
-        speed_change_frame = 10
-    elif key == ord("f") and current_index < total - 1:
-        step = min(speed_change_frame, total - current_index - 1)
-        current_index += step
-        speed_change_frame = 10
-    elif key == ord("r"):
-        del frame_prompt_point_dict[current_index]
-        refresh_image()
-    elif key == ord("h"):
-        should_draw_bbox = not should_draw_bbox
-        refresh_image()
-    elif key == ord("p"):
-        video_segments = propagate_images()
-        refresh_image()
-    elif key == ord("e"):
-        create_dataset(video_segments)
-    elif key == -1:
-        speed_change_frame = 1
-
+while run_session():
+    pass
 
 cv2.destroyAllWindows()
-
 print("Program finished")
